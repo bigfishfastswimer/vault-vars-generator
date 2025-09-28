@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -11,69 +10,109 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/hashicorp/vault/api"
 	"gopkg.in/yaml.v3"
 
-	"github.com/example/vaultfetcher/internal/config"
+	"github.com/bigfishfastswimer/vault-vars-generator/internal/config"
 )
 
+type CLI struct {
+	ConfigPath    string        `kong:"name='config',default='vault_secrets.yaml',help='Path to the vault secrets definition file.'"`
+	BranchName    string        `kong:"name='branch',help='Branch name used to resolve branch-overrides.'"`
+	OutputPath    string        `kong:"name='output',default='vault/vault_received.yaml',help='Destination file for the received secrets.'"`
+	MountPath     string        `kong:"name='mount',default='secrets/sync',help='Vault KV v2 mount path.'"`
+	PasswordField string        `kong:"name='password-field',default='password',help='Field within the Vault secret to read.'"`
+	VaultAddr     string        `kong:"name='vault-addr',help='Override Vault address (defaults to VAULT_ADDR env var).'"`
+	Timeout       time.Duration `kong:"name='timeout',default='30s',help='Maximum duration for a single Vault request.'"`
+	Validate      bool          `kong:"help='Validate configuration without contacting Vault.'"`
+}
+
 func main() {
-	var (
-		configPath    = flag.String("config", "vault_secrets.yaml", "Path to the vault secrets definition file")
-		branchName    = flag.String("branch", "", "Branch name used to resolve branch-overrides")
-		outputPath    = flag.String("output", filepath.Join("vault", "vault_received.yaml"), "Destination file for the received secrets")
-		mountPath     = flag.String("mount", "secrets/sync", "Vault KV v2 mount path")
-		passwordField = flag.String("password-field", "password", "Field within the Vault secret to read")
-		vaultAddr     = flag.String("vault-addr", "", "Override Vault address (defaults to VAULT_ADDR env var)")
-		timeout       = flag.Duration("timeout", 30*time.Second, "Maximum duration for a single Vault request")
-	)
-
-	flag.Parse()
-
-	cfg, err := config.Load(*configPath)
+	cli := CLI{}
+	args := normalizeArgs(os.Args[1:])
+	parser := kong.Must(&cli, kong.Name("vaultfetcher"))
+	ctx, err := parser.Parse(args)
 	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		parser.FatalIfErrorf(err)
+	}
+	if err := cli.Run(context.Background()); err != nil {
+		ctx.FatalIfErrorf(err)
+	}
+}
+
+func normalizeArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
 	}
 
-	branch := resolveBranchName(*branchName)
+	normalized := make([]string, len(args))
+	copy(normalized, args)
 
-	addr := strings.TrimSpace(*vaultAddr)
+	for i, arg := range normalized {
+		if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || len(arg) <= 2 {
+			continue
+		}
+
+		normalized[i] = "-" + arg
+	}
+
+	return normalized
+}
+
+func (cli *CLI) Run(ctx context.Context) error {
+	cfg, err := config.Load(cli.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	branch := resolveBranchName(cli.BranchName)
+	log.Printf("resolved branch: %q", branch)
+
+	if cli.Validate {
+		for _, secret := range cfg.VaultSecrets {
+			_ = secret.TargetForBranch(branch)
+		}
+		log.Printf("validation successful for %d secrets", len(cfg.VaultSecrets))
+		return nil
+	}
+
+	addr := strings.TrimSpace(cli.VaultAddr)
 	if addr == "" {
 		addr = strings.TrimSpace(os.Getenv("VAULT_ADDR"))
 	}
 	if addr == "" {
-		log.Fatal("VAULT_ADDR environment variable or --vault-addr flag must be provided")
+		return fmt.Errorf("VAULT_ADDR environment variable or --vault-addr flag must be provided")
 	}
 
 	token := strings.TrimSpace(os.Getenv("VAULT_TOKEN"))
 	if token == "" {
-		log.Fatal("VAULT_TOKEN environment variable must be provided")
+		return fmt.Errorf("VAULT_TOKEN environment variable must be provided")
 	}
 
-	mount := strings.Trim(strings.TrimSpace(*mountPath), "/")
+	mount := strings.Trim(strings.TrimSpace(cli.MountPath), "/")
 	if mount == "" {
-		log.Fatal("mount path cannot be empty")
+		return fmt.Errorf("mount path cannot be empty")
 	}
-
-	log.Printf("resolved branch: %q", branch)
 
 	results := make([]string, 0, len(cfg.VaultSecrets))
 
 	for _, secret := range cfg.VaultSecrets {
 		target := secret.TargetForBranch(branch)
-		password, err := fetchPassword(context.Background(), addr, token, mount, target, *passwordField, *timeout)
+		password, err := fetchPassword(ctx, addr, token, mount, target, cli.PasswordField, cli.Timeout)
 		if err != nil {
-			log.Fatalf("fetch secret %q: %v", secret.Name, err)
+			return fmt.Errorf("fetch secret %q: %w", secret.Name, err)
 		}
 		results = append(results, fmt.Sprintf("%s=%s", secret.Name, password))
 		log.Printf("retrieved secret %q from namespace %q", secret.Name, target.Namespace)
 	}
 
-	if err := writeOutput(*outputPath, results); err != nil {
-		log.Fatalf("write output: %v", err)
+	if err := writeOutput(cli.OutputPath, results); err != nil {
+		return fmt.Errorf("write output: %w", err)
 	}
 
-	log.Printf("wrote %d secrets to %s", len(results), *outputPath)
+	log.Printf("wrote %d secrets to %s", len(results), cli.OutputPath)
+	return nil
 }
 
 func resolveBranchName(flagValue string) string {
