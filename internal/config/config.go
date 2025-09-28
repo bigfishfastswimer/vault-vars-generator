@@ -29,8 +29,9 @@ type TargetWrapper struct {
 
 // BranchOverride allows overriding the default target for a specific branch.
 type BranchOverride struct {
-	Name  string `yaml:"name"`
-	Vault Target `yaml:"vault"`
+	Name         string `yaml:"name"`
+	Vault        Target `yaml:"vault"`
+	VaultEnabled *bool  `yaml:"vault_enabled"`
 }
 
 // Target contains the fields required to locate the secret in Vault.
@@ -102,8 +103,15 @@ func (f *File) Validate() error {
 			}
 		}
 
-		if err := validateTarget(s.Default.Vault, fmt.Sprintf("secret %q default", s.Name)); err != nil {
-			issues = append(issues, err.Error())
+		hasDefault := targetDefined(s.Default.Vault)
+		if hasDefault {
+			if err := validateTarget(s.Default.Vault, fmt.Sprintf("secret %q default", s.Name)); err != nil {
+				issues = append(issues, err.Error())
+			}
+		}
+
+		if !hasDefault && len(s.BranchOverrides) == 0 {
+			issues = append(issues, fmt.Sprintf("secret %q must define a default target or at least one branch override", s.Name))
 		}
 
 		overrideNames := make(map[string]struct{})
@@ -117,8 +125,29 @@ func (f *File) Validate() error {
 				}
 				overrideNames[o.Name] = struct{}{}
 			}
+			enabled := true
+			if o.VaultEnabled != nil {
+				enabled = *o.VaultEnabled
+			}
+
+			if !enabled {
+				if targetDefined(o.Vault) {
+					issues = append(issues, fmt.Sprintf("secret %q override %q disables vault but defines a vault target", s.Name, o.Name))
+				}
+				continue
+			}
+
+			if !targetDefined(o.Vault) {
+				issues = append(issues, fmt.Sprintf("secret %q override %q must define a vault target when vault is enabled", s.Name, o.Name))
+				continue
+			}
+
 			if err := validateTarget(o.Vault, fmt.Sprintf("secret %q override %q", s.Name, o.Name)); err != nil {
 				issues = append(issues, err.Error())
+			}
+
+			if hasDefault && targetsEqual(o.Vault, s.Default.Vault) {
+				issues = append(issues, fmt.Sprintf("secret %q override %q must not match the default vault target", s.Name, o.Name))
 			}
 		}
 	}
@@ -128,6 +157,14 @@ func (f *File) Validate() error {
 	}
 
 	return nil
+}
+
+func targetDefined(t Target) bool {
+	return strings.TrimSpace(t.AccountID) != "" || strings.TrimSpace(t.Namespace) != ""
+}
+
+func targetsEqual(a, b Target) bool {
+	return strings.TrimSpace(a.AccountID) == strings.TrimSpace(b.AccountID) && strings.TrimSpace(a.Namespace) == strings.TrimSpace(b.Namespace)
 }
 
 func validateTarget(t Target, context string) error {
@@ -166,41 +203,13 @@ func (v *ValidationError) Is(target error) bool {
 	return ok
 }
 
-// TargetForBranch resolves the Vault target for the given branch name.
-func (s *Secret) TargetForBranch(branch string) Target {
-	candidates := branchCandidates(branch)
-	for _, candidate := range candidates {
-		for _, override := range s.BranchOverrides {
-			if override.Name == candidate {
-				return override.Vault
-			}
-		}
-	}
-	return s.Default.Vault
-}
-
-func branchCandidates(branch string) []string {
-	branch = strings.TrimSpace(branch)
-	if branch == "" {
-		return nil
-	}
-
-	candidates := []string{branch}
-
-	if strings.HasPrefix(branch, "refs/heads/") {
-		candidates = append(candidates, strings.TrimPrefix(branch, "refs/heads/"))
-	}
-	if strings.HasPrefix(branch, "origin/") {
-		candidates = append(candidates, strings.TrimPrefix(branch, "origin/"))
-	}
-
-	return candidates
-}
-
 // MustDefaultBranchTarget fetches the default target, ensuring it is valid.
 func (s *Secret) MustDefaultBranchTarget() (Target, error) {
-	if s.Default.Vault.AccountID == "" || s.Default.Vault.Namespace == "" {
-		return Target{}, errors.New("default vault target is incomplete")
+	if !targetDefined(s.Default.Vault) {
+		return Target{}, errors.New("default vault target is not defined")
+	}
+	if err := validateTarget(s.Default.Vault, "secret default"); err != nil {
+		return Target{}, err
 	}
 	return s.Default.Vault, nil
 }
