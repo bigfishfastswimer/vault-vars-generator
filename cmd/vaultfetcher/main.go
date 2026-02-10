@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/bigfishfastswimer/vault-vars-generator/internal/config"
+	"github.com/bigfishfastswimer/vault-vars-generator/internal/validate"
 )
 
 type CLI struct {
@@ -71,7 +72,9 @@ func (cli *CLI) Run(ctx context.Context) error {
 
 	if cli.Validate {
 		for _, secret := range cfg.VaultSecrets {
-			_ = secret.TargetForBranch(branch)
+			if _, enabled := validate.TargetForBranch(secret, branch); !enabled {
+				log.Printf("secret %q skips Vault for branch %q", secret.Name, branch)
+			}
 		}
 		log.Printf("validation successful for %d secrets", len(cfg.VaultSecrets))
 		return nil
@@ -98,7 +101,11 @@ func (cli *CLI) Run(ctx context.Context) error {
 	results := make([]string, 0, len(cfg.VaultSecrets))
 
 	for _, secret := range cfg.VaultSecrets {
-		target := secret.TargetForBranch(branch)
+		target, enabled := validate.TargetForBranch(secret, branch)
+		if !enabled {
+			log.Printf("skipping secret %q for branch %q because Vault is disabled", secret.Name, branch)
+			continue
+		}
 		password, err := fetchPassword(ctx, addr, token, mount, target, cli.PasswordField, cli.Timeout)
 		if err != nil {
 			return fmt.Errorf("fetch secret %q: %w", secret.Name, err)
